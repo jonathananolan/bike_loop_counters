@@ -4,20 +4,42 @@ library(tidyr)
 library(data.table)
 library(janitor)
 library(lubridate)
+library(zoo)
+
+
 
 metadata <- readxl::read_excel("data/VicRoads_Bike_Site_Number_Listing.xlsx") %>% 
-  distinct(SITE_XN_ROUTE,LOC_LEG,.keep_all = TRUE) %>% clean_names()
+  distinct(SITE_XN_ROUTE,LOC_LEG,.keep_all = TRUE) %>% clean_names() %>% select(site_xn_route,loc_leg,loc_desc)
 
-temp = list.files(pattern="*.csv*",recursive = TRUE)
-view(temp)
-myfiles = lapply(temp, fread)
+
+filenames_ph <- list.files(pattern="*.csv*",
+                        recursive = TRUE,
+                          path = "public_holidays/")
+
+filenames_ph = paste0("public_holidays/",filenames_ph)
+
+
+public_holidays = lapply(filenames_ph, fread) %>% 
+  bind_rows() %>% 
+  clean_names() %>%
+  mutate(date = ymd(date),
+         jurisdiction = if_else(is.na(jurisdiction),applicable_to,jurisdiction),
+         jurisdiction = tolower(jurisdiction)) %>% 
+  filter(str_detect(jurisdiction,"vic|nat"))%>% 
+  select(date) %>% 
+  mutate(public_holiday = 1)
+
+
+filenames_counts <- list.files(pattern="*.csv*",
+                  recursive = TRUE,
+                  path = "data") 
+
+filenames_counts = paste0("data/",filenames_counts)
+
+myfiles = lapply(filenames_counts, fread)
   
   
-  output <- dplyr::bind_rows(myfiles) %>% clean_names()
-  
-  
-  
-  output_grouped <- output %>% 
+  output <- dplyr::bind_rows(myfiles) %>% clean_names()%>%
                     group_by(vehicle, 
                              site_xn_route,
                              direction,
@@ -30,48 +52,49 @@ myfiles = lapply(temp, fread)
     mutate(date = dmy(date),
            year = paste0("y",year(date)),
            month = month(date),
-           day = day(date))
+           day = day(date),
+           wday = wday(date,label = TRUE,abbr = FALSE),
+           weekend = if_else(wday %in% c("Saturday","Sunday"),"weekend","weekday"),
+           week = week(date)) %>% 
+    left_join(metadata) %>% 
+    left_join(public_holidays) %>% 
+    filter(is.na(public_holiday)) %>% 
+    ungroup() %>% 
+    group_by(weekend,loc_leg) %>% 
+    arrange(date) %>% 
+    mutate(path_lane = case_when(str_detect(loc_desc,"BIKE PATH") ~ "bike_path",
+                                 str_detect(loc_desc,"BIKE LANE") ~ "bike_lane",
+                                 TRUE ~ "other"),
+           roll_length = if_else(weekend == "weekend",11,31),
+           median_200_day = rollmedian(n,roll_length,align = "right", fill = 0)) %>% 
+    filter( n > (median_200_day * .2),
+            median_200_day!=0,
+            path_lane !="other")
   
-month_av <- output_grouped %>% group_by(month,
-                                        year,
-                                        site_xn_route,
-                                        loc_leg,
-                                        direction) %>% 
-    summarise(month_median = median(n, na.rm = TRUE))
+
   
   
-graph <- output_grouped %>% 
-            left_join(month_av) %>% 
-             mutate(month_day = mdy(paste0(month,"-",day,"-2020"))) %>% 
-             filter(n < (month_median)) %>%
-             group_by(site_xn_route,
-                      loc_leg,
-                      month,
-                      day) %>% 
-             select(-month_median, - date) %>% 
-             spread(year,n) %>% 
-             mutate(ratio = y2020/y2019) %>% 
-             filter(!is.na(ratio)) %>% 
-  left_join(metadata)
-
-write_csv(graph,"results.csv")
-
-
-
-
-graph %>% 
-  filter(str_detect(loc_desc,"UPFIELD")) %>% view()
-    ggplot(aes(x = month_day, 
-               y = ratio,
-               fill = as.factor(loc_leg)))+
+yearly_graph <- output %>% 
+  filter(week<20) %>% 
+  group_by(week,year,path_lane,weekend,loc_leg) %>% 
+  filter(n()>1) %>% 
+  summarise(median = median(n)) %>% 
+  spread(year,median) %>% 
+  filter(!is.na(y2019), 
+         !is.na(y2020)) %>%
+  mutate(ratio = y2020/y2019)
+  
+  
+  yearly_graph %>% 
+    filter(ratio!= 0 ) %>% 
+    ggplot(aes(x = week, 
+             y = ratio))+
+  geom_point(stat = "identity")+
+  facet_grid(path_lane~weekend) +
   geom_smooth()+
-  labs(title = "More people are cycling!",
-       subtitle = "Ratio of cycling from 2019 to 2020. Loess fit. ",
-       caption = "Data from Vicroads sensors on shared paths.",
-       x = element_blank())+
-  geom_hline(yintercept = 1)+
-  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
-  geom_point()
+  coord_cartesian(ylim = c(0,4))+
+  labs(y = "ratio of median value this year compared with the median value of the same weekend/week last year",
+       caption = "excludes public holidays.")
   
-                    
+  
   
